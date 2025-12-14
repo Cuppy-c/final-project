@@ -115,19 +115,14 @@ if 'uploaded_data' not in st.session_state:
 if 'manual_data' not in st.session_state:
     st.session_state.manual_data = {}
 if 'current_dataset' not in st.session_state:
-    st.session_state.current_dataset = '中型制造企业'
+    st.session_state.current_dataset = '智能电子制造企业'
 if 'data_source' not in st.session_state:
     st.session_state.data_source = '示例数据'
 
 # 排放因子数据库
 EMISSION_FACTORS = {
-    'electricity': {
-        '华东电网': 0.7035,
-        '华北电网': 0.9206,
-        '华南电网': 0.6212
-    },
     'natural_gas': 2.162,
-    'diesel': 2.68,
+    'diesel': 2.732,
     'coal': 2.53,
     'truck_transport': 0.062,
     'rail_transport': 0.022,
@@ -138,163 +133,544 @@ EMISSION_FACTORS = {
     'plastic': 2.53
 }
 
+# ========== 1. 定义改进的排放因子 ==========
+IMPROVED_FACTORS = {
+    # Scope 1: 直接排放
+    'diesel': 2.732,  # 修正：柴油排放因子 (kg CO₂/L)
+    'natural_gas': 2.162,  # 保持：天然气排放因子 (kg CO₂/m³)
+
+    # Scope 2: 外购电力
+    'electricity': {
+        '华东电网': 0.7035,
+        '华北电网': 0.8571,  # 修正：使用2022年官方数据
+        '华南电网': 0.6112,  # 修正：使用2022年官方数据
+        '华中电网': 0.5253,  # 新增
+        '东北电网': 0.8789,  # 新增
+        '西北电网': 0.6675  # 新增
+    },
+
+    # Scope 3: 运输排放 - 使用全局EMISSION_FACTORS中的值，但修正单位理解
+    'truck_transport': 0.062,  # kg CO₂/(ton·km) - 修正理解
+    'rail_transport': 0.022,  # kg CO₂/(ton·km)
+    'ship_transport': 0.010,  # kg CO₂/(ton·km)
+    'air_transport': 0.805,  # kg CO₂/(ton·km)
+
+    # Scope 3: 物料排放
+    'steel': 1.85,  # 钢材 (kg CO₂/kg)
+    'aluminum': 8.24,  # 铝材
+    'plastic': 2.53,  # 塑料
+    'electronics': 0.50  # 电子元件
+}
+
+
+# ========== 2. 定义改进的计算函数 ==========
+def calculate_scope1_improved(fuel_data):
+    """改进的范围1计算"""
+    scope1 = 0
+    if 'diesel_l' in fuel_data:
+        scope1 += fuel_data['diesel_l'] * IMPROVED_FACTORS['diesel']
+    if 'natural_gas_m3' in fuel_data:
+        scope1 += fuel_data['natural_gas_m3'] * IMPROVED_FACTORS['natural_gas']
+    return scope1 / 1000  # 转换为吨
+
+
+def calculate_scope2_improved(electricity_data, region='华东电网'):
+    """改进的范围2计算"""
+    if 'electricity_kwh' in electricity_data:
+        factor = IMPROVED_FACTORS['electricity'].get(region, 0.7035)
+        return (electricity_data['electricity_kwh'] * factor) / 1000
+    return 0
+
+
+def calculate_scope3_improved(supplier_data):
+    """改进的范围3计算（包含供应商排行）"""
+    scope3 = 0
+
+    if supplier_data is not None and not supplier_data.empty:
+        total_material_emission = 0
+        total_transport_emission = 0
+
+        # 存储每个供应商的详细排放数据
+        supplier_emissions = []
+
+        for idx, supplier in supplier_data.iterrows():
+            supplier_name = supplier.get('name', f'供应商{idx}')
+            supplier_type = supplier.get('type', '未知')
+            supplier_id = supplier.get('supplier_id', f'SUP{idx:03d}')
+
+            # 1. 物料排放计算
+            material_emission = 0
+
+            # 根据供应商类型确定物料因子
+            material_factor_map = {
+                'steel': 2.20,  # 钢材 (kg CO₂/kg)
+                'aluminum': 8.60,  # 铝材
+                'plastic': 1.85,  # 塑料
+                'electronics': 0.50  # 电子元件
+            }
+
+            # 简化：根据type关键字匹配
+            material_factor = 2.0  # 默认值
+            for key in material_factor_map:
+                if key in str(supplier_type).lower():
+                    material_factor = material_factor_map[key]
+                    break
+
+            # 获取或估算年采购量（吨）
+            if 'annual_purchase_volume' in supplier:
+                annual_purchase_ton = float(supplier['annual_purchase_volume'])
+            elif 'annual_purchase_volume_ton' in supplier:
+                annual_purchase_ton = float(supplier['annual_purchase_volume_ton'])
+            else:
+                # 根据供应商类型估算
+                if 'steel' in str(supplier_type).lower():
+                    annual_purchase_ton = np.random.uniform(50, 200)  # 钢材供应商
+                elif 'aluminum' in str(supplier_type).lower():
+                    annual_purchase_ton = np.random.uniform(20, 100)  # 铝材供应商
+                elif 'plastic' in str(supplier_type).lower():
+                    annual_purchase_ton = np.random.uniform(30, 150)  # 塑料供应商
+                else:
+                    annual_purchase_ton = np.random.uniform(10, 80)  # 其他
+
+            material_emission = annual_purchase_ton * 1000 * material_factor  # 吨转kg
+            total_material_emission += material_emission
+
+            # 2. 运输排放计算
+            transport_emission = 0
+
+            # 获取运输距离
+            if 'distance_km' in supplier:
+                distance_km = float(supplier['distance_km'])
+            elif 'lat' in supplier and 'lon' in supplier:
+                # 计算到苏州的距离
+                try:
+                    # 工厂位置（苏州）
+                    factory_lat, factory_lon = 31.2989, 120.5853
+                    supplier_lat, supplier_lon = float(supplier['lat']), float(supplier['lon'])
+
+                    # 使用您的 calculate_distance 函数
+                    distance_km = calculate_distance(factory_lat, factory_lon, supplier_lat, supplier_lon)
+                except:
+                    distance_km = np.random.uniform(100, 800)  # 随机距离
+            else:
+                distance_km = np.random.uniform(100, 800)  # 随机距离
+
+            # 确定运输方式
+            if 'transport_mode' in supplier:
+                transport_mode = supplier['transport_mode']
+            elif 'transport' in supplier:
+                transport_mode = supplier['transport']
+            else:
+                # 根据距离推断运输方式
+                if distance_km < 200:
+                    transport_mode = 'truck'
+                elif distance_km < 1000:
+                    transport_mode = 'rail'
+                else:
+                    transport_mode = 'ship'
+
+            # 获取运输排放因子
+            transport_factor_map = {
+                'truck': 0.062,  # 公路运输
+                'rail': 0.022,  # 铁路运输
+                'ship': 0.010,  # 水路运输
+                'air': 0.805  # 航空运输
+            }
+
+            transport_factor = transport_factor_map.get(
+                transport_mode.lower(),
+                transport_factor_map['truck']
+            )
+
+            # 获取运输频率和重量
+            if 'transport_frequency_per_month' in supplier:
+                trips_per_month = float(supplier['transport_frequency_per_month'])
+            else:
+                trips_per_month = np.random.uniform(0.5, 4)  # 每月0.5-4次
+
+            if 'weight_per_trip_ton' in supplier:
+                weight_per_trip_ton = float(supplier['weight_per_trip_ton'])
+            else:
+                weight_per_trip_ton = np.random.uniform(5, 20)  # 每次5-20吨
+
+            trips_per_year = trips_per_month * 12
+
+            # 运输排放 = 距离 × 重量 × 次数 × 因子
+            transport_emission = distance_km * weight_per_trip_ton * trips_per_year * transport_factor
+            total_transport_emission += transport_emission
+
+            # 计算供应商总排放（吨）
+            supplier_total_emission = (material_emission + transport_emission) / 1000
+
+            # 存储供应商排放数据
+            supplier_emissions.append({
+                'supplier_id': supplier_id,
+                'supplier_name': supplier_name,
+                'supplier_type': supplier_type,
+                'material_emission_t': material_emission / 1000,
+                'transport_emission_t': transport_emission / 1000,
+                'total_emission_t': supplier_total_emission,
+                'annual_purchase_ton': annual_purchase_ton,
+                'distance_km': distance_km,
+                'transport_mode': transport_mode,
+                'trips_per_year': trips_per_year,
+                'weight_per_trip_ton': weight_per_trip_ton,
+                'material_factor': material_factor,
+                'transport_factor': transport_factor
+            })
+
+        # 排序：按总排放降序
+        supplier_emissions.sort(key=lambda x: x['total_emission_t'], reverse=True)
+
+        # 计算占比
+        total_emission_t = (total_material_emission + total_transport_emission) / 1000
+
+        for supplier in supplier_emissions:
+            if total_emission_t > 0:
+                supplier['emission_percentage'] = (supplier['total_emission_t'] / total_emission_t) * 100
+            else:
+                supplier['emission_percentage'] = 0
+
+        # 总计范围3排放
+        scope3 = total_emission_t
+
+        # 存储详细结果
+        scope3_details = {
+            'total': scope3,
+            'material': total_material_emission / 1000,
+            'transport': total_transport_emission / 1000,
+            'supplier_count': len(supplier_data),
+            'supplier_emissions': supplier_emissions,  # 新增：包含每个供应商的排放数据
+            'top_emitters': supplier_emissions[:5] if len(supplier_emissions) > 5 else supplier_emissions
+        }
+
+        return scope3, scope3_details
+
+    return 0, {
+        'total': 0,
+        'material': 0,
+        'transport': 0,
+        'supplier_count': 0,
+        'supplier_emissions': [],
+        'top_emitters': []
+    }
+
 
 # ============================================
 # 3. 示例数据系统
 # ============================================
-
-class SampleDataSystem:
-    """示例数据系统"""
+class EnhancedSampleDataSystem:
+    """增强版示例数据系统"""
 
     def __init__(self):
-        self.datasets = {}
-        self.initialize_datasets()
-
-    def initialize_datasets(self):
-        """初始化所有示例数据集"""
         self.datasets = {
-            '中型制造企业': self.create_medium_manufacturing_data(),
-            '大型电子企业': self.create_large_electronics_data(),
-            '小型零部件厂': self.create_small_component_data(),
-            '绿色能源公司': self.create_green_energy_data(),
-            '出口贸易公司': self.create_export_trading_data()
+            '智能电子制造企业': self.create_smart_electronics_data(),
+            '中型机械设备厂': self.create_medium_machinery_data(),
+            '绿色化工企业': self.create_green_chemical_data(),
+            '汽车零部件供应商': self.create_auto_parts_data(),
+            '食品加工企业': self.create_food_processing_data()
         }
 
-    def create_medium_manufacturing_data(self):
-        """创建中型制造企业数据"""
+    def create_smart_electronics_data(self):
+        """智能电子制造企业数据"""
         return {
-            'company_info': pd.DataFrame([{
-                'company_id': 'COMP001',
-                'company_name': '苏州精密制造有限公司',
-                'industry': '电子设备制造',
-                'location': '江苏省苏州市',
-                'employee_count': 500,
-                'annual_revenue_million': 500
-            }]),
-            'energy_data': self._create_energy_data(250000, 5000, 1000),
-            'production_data': self._create_production_data(['智能控制器', '传感器模块']),
-            'supplier_data': pd.DataFrame([
-                {'name': '宝钢集团', 'type': 'steel', 'lat': 31.2304, 'lon': 121.4737, 'rating': 'A'},
-                {'name': '中铝国际', 'type': 'aluminum', 'lat': 39.9042, 'lon': 116.4074, 'rating': 'B'},
-                {'name': '巴斯夫', 'type': 'plastic', 'lat': 31.5334, 'lon': 121.6738, 'rating': 'A'}
-            ])
+            'company_info': self.create_rich_company_info('电子设备制造'),
+            'energy_data': self.create_rich_energy_data(250000, 5000, 1000),
+            'production_data': self.create_rich_production_data(['智能控制器', '传感器模块', '通讯模块']),
+            'supplier_data': self.create_rich_supplier_data(['钢材', '铝材', '电子元件', '塑料粒子'])
         }
 
-    def create_large_electronics_data(self):
-        """创建大型电子企业数据"""
+    def create_medium_machinery_data(self):
+        """中型机械设备厂数据"""
         return {
-            'company_info': pd.DataFrame([{
-                'company_id': 'COMP002',
-                'company_name': '华星电子股份有限公司',
-                'industry': '电子设备制造',
-                'location': '广东省深圳市',
-                'employee_count': 2000,
-                'annual_revenue_million': 2500
-            }]),
-            'energy_data': self._create_energy_data(500000, 10000, 2000),
-            'production_data': self._create_production_data(['智能手机', '平板电脑', '笔记本电脑']),
-            'supplier_data': pd.DataFrame([
-                {'name': '台积电', 'type': 'semiconductor', 'lat': 24.7800, 'lon': 120.9960, 'rating': 'A+'},
-                {'name': '三星电子', 'type': 'display', 'lat': 37.5665, 'lon': 126.9780, 'rating': 'A'},
-                {'name': '索尼', 'type': 'camera', 'lat': 35.6895, 'lon': 139.6917, 'rating': 'A'}
-            ])
+            'company_info': self.create_rich_company_info('机械设备制造'),
+            'energy_data': self.create_rich_energy_data(180000, 3000, 2000),
+            'production_data': self.create_rich_production_data(['数控机床', '工业机器人', '传送设备']),
+            'supplier_data': self.create_rich_supplier_data(['钢材', '铸铁', '电机', '控制系统'])
         }
 
-    def create_small_component_data(self):
-        """创建小型零部件厂数据"""
+    def create_green_chemical_data(self):
+        """绿色化工企业数据"""
         return {
-            'company_info': pd.DataFrame([{
-                'company_id': 'COMP003',
-                'company_name': '东莞精密零件有限公司',
-                'industry': '零部件制造',
-                'location': '广东省东莞市',
-                'employee_count': 120,
-                'annual_revenue_million': 80
-            }]),
-            'energy_data': self._create_energy_data(80000, 2000, 500),
-            'production_data': self._create_production_data(['连接器', '轴承', '齿轮']),
-            'supplier_data': pd.DataFrame([
-                {'name': '本地钢材', 'type': 'steel', 'lat': 23.0207, 'lon': 113.7518, 'rating': 'B'},
-                {'name': '广东铝业', 'type': 'aluminum', 'lat': 23.1291, 'lon': 113.2644, 'rating': 'C'}
-            ])
+            'company_info': self.create_rich_company_info('化工制造'),
+            'energy_data': self.create_rich_energy_data(350000, 8000, 1500),
+            'production_data': self.create_rich_production_data(['环保涂料', '生物降解塑料', '清洁剂']),
+            'supplier_data': self.create_rich_supplier_data(['化工原料', '包装材料', '催化剂'])
         }
 
-    def create_green_energy_data(self):
-        """创建绿色能源公司数据"""
+    def create_auto_parts_data(self):
+        """汽车零部件供应商数据"""
         return {
-            'company_info': pd.DataFrame([{
-                'company_id': 'COMP004',
-                'company_name': '阳光新能源有限公司',
-                'industry': '新能源制造',
-                'location': '江苏省常州市',
-                'employee_count': 300,
-                'annual_revenue_million': 800,
-                'green_ratio': 0.65
-            }]),
-            'energy_data': self._create_energy_data(200000, 3000, 500),
-            'production_data': self._create_production_data(['太阳能板', '储能电池']),
-            'supplier_data': pd.DataFrame([
-                {'name': '绿色钢铁', 'type': 'recycled_steel', 'lat': 39.6304, 'lon': 118.1800, 'rating': 'A+'},
-                {'name': '环保塑料', 'type': 'bioplastic', 'lat': 29.8782, 'lon': 121.5495, 'rating': 'A'}
-            ])
+            'company_info': self.create_rich_company_info('汽车零部件制造'),
+            'energy_data': self.create_rich_energy_data(150000, 2500, 800),
+            'production_data': self.create_rich_production_data(['汽车座椅', '内饰件', '外饰件']),
+            'supplier_data': self.create_rich_supplier_data(['钢材', '塑料', '皮革', '电子元件'])
         }
 
-    def create_export_trading_data(self):
-        """创建出口贸易公司数据"""
+    def create_food_processing_data(self):
+        """食品加工企业数据"""
         return {
-            'company_info': pd.DataFrame([{
-                'company_id': 'COMP005',
-                'company_name': '上海国际贸易有限公司',
-                'industry': '贸易',
-                'location': '上海市',
-                'employee_count': 150,
-                'annual_revenue_million': 1200
-            }]),
-            'energy_data': self._create_energy_data(50000, 1000, 200),
-            'production_data': self._create_production_data(['电子产品', '机械设备']),
-            'supplier_data': pd.DataFrame([
-                {'name': '德国博世', 'type': 'auto_parts', 'lat': 48.7758, 'lon': 9.1829, 'rating': 'A'},
-                {'name': '日本三菱', 'type': 'electronics', 'lat': 35.6895, 'lon': 139.6917, 'rating': 'A'}
-            ])
+            'company_info': self.create_rich_company_info('食品加工'),
+            'energy_data': self.create_rich_energy_data(120000, 1500, 500),
+            'production_data': self.create_rich_production_data(['饼干', '饮料', '方便食品']),
+            'supplier_data': self.create_rich_supplier_data(['粮食', '包装', '添加剂'])
         }
 
-    def _create_energy_data(self, electricity_base, gas_base, diesel_base):
-        """创建能源数据"""
-        months = []
-        for i in range(12):
-            month_date = datetime(2024, 1, 1) + timedelta(days=30 * i)
-            months.append(month_date.strftime('%Y-%m'))
+    # ========== 数据生成方法 ==========
 
-        data = []
-        for month in months:
-            fluctuation = np.random.uniform(0.9, 1.1)
-            data.append({
-                'month': month,
-                'electricity_kwh': round(electricity_base * fluctuation),
-                'natural_gas_m3': round(gas_base * fluctuation),
-                'diesel_l': round(diesel_base * fluctuation)
+    def create_rich_company_info(self, industry):
+        """创建丰富的公司信息"""
+        base_info = {
+            '电子设备制造': {
+                'company_name': '苏州精密智能制造有限公司',
+                'employee_count': 680,
+                'annual_revenue_million': 850,
+                'main_products': '智能控制器、传感器模块、工业通讯设备'
+            },
+            '机械设备制造': {
+                'company_name': '华东机械设备有限公司',
+                'employee_count': 450,
+                'annual_revenue_million': 520,
+                'main_products': '数控机床、工业机器人、自动化设备'
+            },
+            '化工制造': {
+                'company_name': '绿源化工有限公司',
+                'employee_count': 320,
+                'annual_revenue_million': 680,
+                'main_products': '环保涂料、生物降解材料、特种化学品'
+            },
+            '汽车零部件制造': {
+                'company_name': '安达汽车零部件有限公司',
+                'employee_count': 580,
+                'annual_revenue_million': 720,
+                'main_products': '汽车座椅、内饰件、外饰件'
+            },
+            '食品加工': {
+                'company_name': '康美食品有限公司',
+                'employee_count': 280,
+                'annual_revenue_million': 380,
+                'main_products': '饼干、饮料、方便食品'
+            }
+        }
+
+        info = base_info.get(industry, base_info['电子设备制造'])
+
+        return pd.DataFrame([{
+            'company_id': 'CMP001',
+            'company_name': info['company_name'],
+            'industry': industry,
+            'location': '江苏省苏州市',
+            'employee_count': info['employee_count'],
+            'annual_revenue_million': info['annual_revenue_million'],
+            'main_products': info['main_products'],
+            'established_year': 2010,
+            'facility_area_sqm': 20000,
+            'energy_manager': '王明',
+            'certifications': 'ISO9001, ISO14001'
+        }])
+
+    def create_rich_energy_data(self, electricity_base, gas_base, diesel_base):
+        """创建丰富的能源数据"""
+        np.random.seed(42)
+
+        energy_records = []
+
+        # 生成24个月数据
+        for i in range(24):
+            month_idx = i + 1
+            year = 2023 if i < 12 else 2024
+            month = (i % 12) + 1
+
+            # 1. 长期趋势：每年下降2%
+            trend_factor = 0.98 ** (i // 12)
+
+            # 2. 季节性：夏季高，冬季中，春秋低
+            if month in [6, 7, 8]:  # 夏季
+                season_factor = 1.25
+            elif month in [12, 1, 2]:  # 冬季
+                season_factor = 1.15
+            else:  # 春秋
+                season_factor = 0.95
+
+            # 3. 随机波动
+            random_factor = np.random.uniform(0.9, 1.1)
+
+            # 计算各能源消耗
+            electricity = electricity_base * trend_factor * season_factor * random_factor
+            natural_gas = gas_base * trend_factor * (1 + 0.3 * np.sin(2 * np.pi * (month - 1) / 12)) * random_factor
+            diesel = diesel_base * trend_factor * random_factor
+            water = electricity_base * 0.02 * season_factor * random_factor  # 用水量与用电相关
+
+            # 可再生能源（逐年增加）
+            solar_power = electricity * (0.05 + 0.008 * i)  # 从5%开始每月+0.8%
+
+            energy_records.append({
+                'year_month': f'{year}-{month:02d}',
+                'electricity_kwh': round(electricity),
+                'natural_gas_m3': round(natural_gas),
+                'diesel_l': round(diesel),
+                'water_tons': round(water),
+                'solar_power_kwh': round(solar_power),
+                'energy_cost_yuan': round(electricity * 0.8 + natural_gas * 3.5 + diesel * 8),
+                'production_days': np.random.randint(22, 26),
+                'avg_temperature_c': np.random.randint(-5, 35),
+                'energy_efficiency': round(np.random.uniform(85, 95), 1),
+                'maintenance_status': '正常' if np.random.random() > 0.1 else '检修中',
+                'energy_manager': ['张三', '李四', '王五'][i % 3]
             })
 
-        return pd.DataFrame(data)
+        return pd.DataFrame(energy_records)
 
-    def _create_production_data(self, product_types):
-        """创建生产数据"""
-        months = []
-        for i in range(12):
-            month_date = datetime(2024, 1, 1) + timedelta(days=30 * i)
-            months.append(month_date.strftime('%Y-%m'))
+    def create_rich_production_data(self, product_types):
+        """创建丰富的生产数据"""
+        np.random.seed(43)
 
-        data = []
-        for month in months:
+        records = []
+
+        # 生成24个月数据
+        for i in range(24):
+            year = 2023 if i < 12 else 2024
+            month = (i % 12) + 1
+
             for product in product_types:
-                data.append({
-                    'month': month,
+                # 基础产量（不同产品不同）
+                base_volume = {
+                    '智能控制器': 5000,
+                    '传感器模块': 8000,
+                    '通讯模块': 6000,
+                    '数控机床': 200,
+                    '工业机器人': 150,
+                    '传送设备': 300,
+                    '环保涂料': 10000,
+                    '生物降解塑料': 8000,
+                    '清洁剂': 12000,
+                    '汽车座椅': 3000,
+                    '内饰件': 5000,
+                    '外饰件': 4000,
+                    '饼干': 20000,
+                    '饮料': 15000,
+                    '方便食品': 10000
+                }.get(product, 5000)
+
+                # 增长趋势
+                growth_factor = 1 + 0.01 * i  # 每月增长1%
+
+                # 季节性
+                if month in [11, 12, 1]:  # 旺季
+                    season_factor = 1.3
+                elif month in [6, 7, 8]:  # 淡季
+                    season_factor = 0.9
+                else:
+                    season_factor = 1.0
+
+                # 随机波动
+                random_factor = np.random.uniform(0.95, 1.05)
+
+                # 计算产量
+                volume = base_volume * growth_factor * season_factor * random_factor
+
+                # 质量指标
+                defect_rate = np.random.uniform(0.01, 0.05)  # 1-5%不良率
+
+                records.append({
+                    'year_month': f'{year}-{month:02d}',
                     'product_type': product,
-                    'production_volume': np.random.randint(1000, 10000),
-                    'defect_rate': round(np.random.uniform(0.01, 0.05), 3)
+                    'production_volume': round(volume),
+                    'defect_quantity': round(volume * defect_rate),
+                    'defect_rate_percent': round(defect_rate * 100, 2),
+                    'raw_material_cost_yuan': round(volume * np.random.uniform(50, 200)),
+                    'labor_cost_yuan': round(volume * np.random.uniform(10, 50)),
+                    'equipment_utilization_percent': round(np.random.uniform(75, 92), 1),
+                    'production_efficiency': round(np.random.uniform(85, 98), 1),
+                    'customer_feedback_score': round(np.random.uniform(4.0, 5.0), 1),
+                    'export_percentage': round(np.random.uniform(10, 80), 1)
                 })
 
-        return pd.DataFrame(data)
+        return pd.DataFrame(records)
+
+    def create_rich_supplier_data(self, supplier_types):
+        """创建丰富的供应商数据"""
+        np.random.seed(44)
+
+        # 中国主要城市坐标
+        cities = {
+            '上海': (31.2304, 121.4737),
+            '苏州': (31.2989, 120.5853),
+            '深圳': (22.5431, 114.0579),
+            '东莞': (23.0207, 113.7518),
+            '天津': (39.3434, 117.3616),
+            '重庆': (29.5630, 106.5516),
+            '武汉': (30.5928, 114.3055),
+            '青岛': (36.0671, 120.3826),
+            '宁波': (29.8683, 121.5440),
+            '沈阳': (41.8057, 123.4315)
+        }
+
+        records = []
+        city_list = list(cities.keys())
+
+        # 每种类型创建2-3个供应商
+        for i, supplier_type in enumerate(supplier_types):
+            for j in range(np.random.randint(2, 4)):
+                city = city_list[(i * 3 + j) % len(city_list)]
+                lat, lon = cities[city]
+
+                # 添加微小偏移
+                lat += np.random.uniform(-0.1, 0.1)
+                lon += np.random.uniform(-0.1, 0.1)
+
+                # 计算到苏州的距离
+                distance = self.calculate_distance(31.2989, 120.5853, lat, lon)
+
+                # 供应商评级
+                total_score = np.random.uniform(70, 95)
+                if total_score > 90:
+                    rating = 'A+'
+                elif total_score > 85:
+                    rating = 'A'
+                elif total_score > 80:
+                    rating = 'B'
+                elif total_score > 75:
+                    rating = 'C'
+                else:
+                    rating = 'D'
+
+                records.append({
+                    'supplier_id': f'SUP{i:02d}{j}',
+                    'name': f'{city}{supplier_type[:2]}供应商',
+                    'type': supplier_type,
+                    'city': city,
+                    'lat': round(lat, 4),
+                    'lon': round(lon, 4),
+                    'rating': rating,
+                    'quality_score': round(np.random.uniform(85, 98), 1),
+                    'delivery_days': np.random.randint(7, 21),
+                    'distance_km': round(distance),
+                    'annual_purchase_volume': round(np.random.uniform(50, 300), 1),
+                    'cooperation_years': np.random.randint(1, 10),
+                    'contact_person': ['张经理', '李主任', '王总监', '刘总'][j % 4]
+                })
+
+        return pd.DataFrame(records)
+
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        """计算两个经纬度坐标之间的距离（公里）"""
+        # 将十进制度数转化为弧度
+        lat1_rad = math.radians(lat1)
+        lon1_rad = math.radians(lon1)
+        lat2_rad = math.radians(lat2)
+        lon2_rad = math.radians(lon2)
+
+        # Haversine公式
+        dlon = lon2_rad - lon1_rad
+        dlat = lat2_rad - lat1_rad
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+        c = 2 * math.asin(math.sqrt(a))
+
+        # 地球平均半径（公里）
+        r = 6371.0
+
+        return c * r
 
     def get_dataset(self, dataset_name):
         """获取数据集"""
@@ -304,44 +680,6 @@ class SampleDataSystem:
 # ============================================
 # 4. 核心功能模块
 # ============================================
-
-class CarbonCalculator:
-    """碳足迹计算器"""
-
-    @staticmethod
-    def calculate_scope1(fuel_data):
-        """计算范围1排放"""
-        scope1 = 0
-        if 'diesel_l' in fuel_data:
-            scope1 += fuel_data['diesel_l'] * EMISSION_FACTORS['diesel']
-        if 'natural_gas_m3' in fuel_data:
-            scope1 += fuel_data['natural_gas_m3'] * EMISSION_FACTORS['natural_gas']
-        return scope1 / 1000  # 转换为吨
-
-    @staticmethod
-    def calculate_scope2(electricity_data, region='华东电网'):
-        """计算范围2排放"""
-        if 'electricity_kwh' in electricity_data:
-            factor = EMISSION_FACTORS['electricity'].get(region, 0.7035)
-            return (electricity_data['electricity_kwh'] * factor) / 1000
-        return 0
-
-    @staticmethod
-    def calculate_scope3(supplier_data, transport_data):
-        """计算范围3排放"""
-        scope3 = 0
-
-        # 物料采购排放（简化）
-        if supplier_data is not None and not supplier_data.empty:
-            material_emission = len(supplier_data) * 100  # 简化计算
-            scope3 += material_emission
-
-        # 运输排放
-        if transport_data is not None and not transport_data.empty:
-            transport_emission = transport_data['distance_km'].sum() * 0.062 / 1000
-            scope3 += transport_emission
-
-        return scope3
 
 
 # ============================================
@@ -375,7 +713,7 @@ def show_sample_data_system():
 
     # 初始化示例数据系统
     if 'sample_system' not in st.session_state:
-        st.session_state.sample_system = SampleDataSystem()
+        st.session_state.sample_system = EnhancedSampleDataSystem()
 
     sample_system = st.session_state.sample_system
 
@@ -385,11 +723,11 @@ def show_sample_data_system():
     col1, col2, col3 = st.columns(3)
 
     datasets = [
-        ('中型制造企业', '🏭', '典型制造企业，适合一般演示'),
-        ('大型电子企业', '💻', '大规模电子制造，数据量大'),
-        ('小型零部件厂', '⚙️', '小型加工厂，成本敏感'),
-        ('绿色能源公司', '🌱', '环保型企业，低碳示范'),
-        ('出口贸易公司', '🌍', '国际贸易企业，供应链复杂')
+        ('智能电子制造企业', '💻', '电子设备制造，数据维度丰富'),
+        ('中型机械设备厂', '🏭', '机械设备制造，能源消耗典型'),
+        ('绿色化工企业', '🧪', '化工行业，关注环保与安全'),
+        ('汽车零部件供应商', '🚗', '汽车产业链，供应链复杂'),
+        ('食品加工企业', '🍪', '快消品行业，季节性明显')
     ]
 
     # 第一行
@@ -717,69 +1055,78 @@ def calculate_kpi_metrics(data):
         'reduction_description': '年度优化潜力'
     }
 
-    # 如果数据有效，动态计算
     try:
         # 1. 计算月度运输排放
         if 'energy_data' in data and not data['energy_data'].empty:
-            energy_data = data['energy_data']
+            energy_data = data['energy_data'].copy()
 
             # 如果有柴油消耗数据
-            if 'diesel_l' in energy_data.columns:
-                if len(energy_data) >= 2:
-                    # 计算最近一个月的柴油排放
-                    latest_month = energy_data.iloc[-1]
-                    transport_emission = latest_month.get('diesel_l', 0) * EMISSION_FACTORS['diesel'] / 1000
+            if 'diesel_l' in energy_data.columns and len(energy_data) >= 2:
+                # 计算最近一个月的柴油排放
+                latest_month = energy_data.iloc[-1]
+                prev_month = energy_data.iloc[-2]
 
-                    # 计算上个月的变化
-                    if len(energy_data) >= 2:
-                        prev_month = energy_data.iloc[-2]
-                        prev_emission = prev_month.get('diesel_l', 0) * EMISSION_FACTORS['diesel'] / 1000
-                        if prev_emission > 0:
-                            change_percent = (transport_emission - prev_emission) / prev_emission * 100
-                            change_text = f"{'↑' if change_percent > 0 else '↓'} {abs(change_percent):.1f}%"
-                        else:
-                            change_text = "环比 -"
+                latest_emission = latest_month.get('diesel_l', 0) * EMISSION_FACTORS['diesel'] / 1000
+                prev_emission = prev_month.get('diesel_l', 0) * EMISSION_FACTORS['diesel'] / 1000
 
-                        kpi['monthly_transport_emission'] = f"{transport_emission:.1f} tCO₂"
-                        kpi['transport_change'] = f"环比 {change_text}"
+                kpi['monthly_transport_emission'] = f"{latest_emission:.1f} tCO₂"
+
+                # 计算变化
+                if prev_emission > 0:
+                    change_percent = ((latest_emission - prev_emission) / prev_emission) * 100
+                    direction = '↑' if change_percent > 0 else '↓'
+                    kpi['transport_change'] = f"环比 {direction} {abs(change_percent):.1f}%"
+                else:
+                    kpi['transport_change'] = "环比 -"
 
         # 2. 计算单位能耗
         if 'production_data' in data and not data['production_data'].empty:
             production_data = data['production_data']
-            if 'energy_data' in data and not data['energy_data'].empty:
+
+            # 查找生产量列
+            volume_col = None
+            for col in production_data.columns:
+                if any(word in col.lower() for word in ['production_volume', 'volume', 'quantity', 'amount']):
+                    volume_col = col
+                    break
+
+            if volume_col and 'energy_data' in data and not data['energy_data'].empty:
                 energy_data = data['energy_data']
 
                 # 计算总产量
-                if 'production_volume' in production_data.columns:
-                    total_production = production_data['production_volume'].sum()
+                total_production = production_data[volume_col].sum()
 
-                    # 计算总电力消耗
-                    total_electricity = 0
-                    if 'electricity_kwh' in energy_data.columns:
-                        total_electricity = energy_data['electricity_kwh'].sum()
-                    elif 'energy_type' in energy_data.columns and 'consumption' in energy_data.columns:
-                        electricity_data = energy_data[
-                            energy_data['energy_type'].astype(str).str.contains('electricity|电', case=False, na=False)
-                        ]
-                        if not electricity_data.empty:
-                            total_electricity = electricity_data['consumption'].sum()
+                # 计算总电力消耗
+                total_electricity = 0
 
-                    # 计算单位能耗
-                    if total_production > 0:
-                        unit_energy = total_electricity / total_production
+                # 查找电力数据列
+                if 'electricity_kwh' in energy_data.columns:
+                    total_electricity = energy_data['electricity_kwh'].sum()
+                elif 'electricity' in energy_data.columns:
+                    total_electricity = energy_data['electricity'].sum()
+                else:
+                    # 查找数值列
+                    numeric_cols = energy_data.select_dtypes(include=[np.number]).columns
+                    if len(numeric_cols) > 0:
+                        total_electricity = energy_data[numeric_cols[0]].sum()
 
-                        # 与行业基准比较（假设行业基准为80）
-                        industry_benchmark = 80
-                        comparison = (industry_benchmark - unit_energy) / industry_benchmark * 100
+                # 计算单位能耗
+                if total_production > 0 and total_electricity > 0:
+                    unit_energy = total_electricity / total_production
 
-                        kpi['unit_energy_consumption'] = f"{unit_energy:.1f} kWh/台"
-                        kpi['energy_comparison'] = f"{'优于' if comparison > 0 else '低于'}行业 {abs(comparison):.1f}%"
+                    # 与行业基准比较（假设行业基准为80）
+                    industry_benchmark = 80
+                    comparison = ((industry_benchmark - unit_energy) / industry_benchmark) * 100
+
+                    kpi['unit_energy_consumption'] = f"{unit_energy:.1f} kWh/台"
+                    comparison_text = '优于' if comparison > 0 else '低于'
+                    kpi['energy_comparison'] = f"{comparison_text}行业 {abs(comparison):.1f}%"
 
         # 3. 计算供应链排放占比
-        if 'emission_results' in st.session_state and st.session_state.emission_results:
-            results = st.session_state.emission_results
-            total = results.get('total', 1)  # 避免除零
-            scope3 = results.get('scope3', 0)
+        if 'carbon_data' in st.session_state and st.session_state.carbon_data:
+            carbon_data = st.session_state.carbon_data
+            total = carbon_data.get('total', 1)  # 避免除零
+            scope3 = carbon_data.get('scope3', 0)
 
             if total > 0:
                 scope3_percentage = (scope3 / total) * 100
@@ -790,23 +1137,35 @@ def calculate_kpi_metrics(data):
         if 'energy_data' in data and not data['energy_data'].empty:
             energy_data = data['energy_data']
 
-            # 基于当前排放计算减排潜力（假设可以减排5%）
+            # 基于当前排放计算减排潜力
             total_electricity = 0
+
+            # 查找电力数据列
             if 'electricity_kwh' in energy_data.columns:
                 total_electricity = energy_data['electricity_kwh'].sum()
+            elif 'electricity' in energy_data.columns:
+                total_electricity = energy_data['electricity'].sum()
+            else:
+                # 查找数值列
+                numeric_cols = energy_data.select_dtypes(include=[np.number]).columns
+                if len(numeric_cols) > 0:
+                    total_electricity = energy_data[numeric_cols[0]].sum()
 
-            # 计算年度排放
-            annual_emission = total_electricity * EMISSION_FACTORS['electricity']['华东电网'] / 1000
+            # 计算年度排放（假设使用华东电网）
+            if 'electricity' in IMPROVED_FACTORS and isinstance(IMPROVED_FACTORS['electricity'], dict):
+                electricity_factor = IMPROVED_FACTORS['electricity'].get('华东电网', 0.7035)
+                annual_emission = total_electricity * electricity_factor / 1000
 
-            # 减排潜力（假设可以减排5-15%）
-            reduction_potential = annual_emission * np.random.uniform(0.05, 0.15)
-
-            kpi['reduction_potential'] = f"{reduction_potential:.0f} tCO₂"
-            kpi['reduction_description'] = '年度优化潜力'
+                # 减排潜力（假设可以减排5-15%）
+                reduction_potential = annual_emission * np.random.uniform(0.05, 0.15)
+                kpi['reduction_potential'] = f"{reduction_potential:.0f} tCO₂"
+                kpi['reduction_description'] = '年度优化潜力'
 
     except Exception as e:
         # 如果计算出错，使用默认值
         st.warning(f"部分KPI计算失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
     return kpi
 
@@ -1259,6 +1618,7 @@ def show_carbon_calculation():
     """显示碳计算页面"""
     st.markdown('<h2 class="section-header">碳排放计算</h2>', unsafe_allow_html=True)
 
+    # ========== 3. 原有代码部分 ==========
     # 获取数据
     data = get_current_data_for_dashboard()
 
@@ -1267,6 +1627,32 @@ def show_carbon_calculation():
         return
 
     st.info(f"当前使用数据源：{st.session_state.data_source}")
+
+    # 添加排放因子说明
+    with st.expander("查看本次计算使用的排放因子", expanded=False):
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.write("**范围1：直接排放**")
+            st.write(f"- 柴油：{IMPROVED_FACTORS['diesel']} kg CO₂/L")
+            st.write(f"- 天然气：{IMPROVED_FACTORS['natural_gas']} kg CO₂/m³")
+
+        with col2:
+            st.write("**范围2：外购电力**")
+            for region, factor in IMPROVED_FACTORS['electricity'].items():
+                st.write(f"- {region}：{factor} kg/kWh")
+
+        with col3:
+            st.write("**范围3：运输排放**")
+            st.write(f"- 公路运输：{IMPROVED_FACTORS['truck_transport']} kg/(ton·km)")
+            st.write(f"- 铁路运输：{IMPROVED_FACTORS['rail_transport']} kg/(ton·km)")
+            st.write(f"- 水路运输：{IMPROVED_FACTORS['ship_transport']} kg/(ton·km)")
+            st.write(f"- 航空运输：{IMPROVED_FACTORS['air_transport']} kg/(ton·km)")
+
+            st.write("**范围3：物料排放**")
+            st.write(f"- 钢材：{IMPROVED_FACTORS['steel']} kg CO₂/kg")
+            st.write(f"- 铝材：{IMPROVED_FACTORS['aluminum']} kg CO₂/kg")
+            st.write(f"- 塑料：{IMPROVED_FACTORS['plastic']} kg CO₂/kg")
 
     # 创建选项卡
     tab1, tab2, tab3, tab4 = st.tabs(["直接排放", "外购电力排放", "供应链间接排放", "综合计算"])
@@ -1278,13 +1664,24 @@ def show_carbon_calculation():
             # 使用最近一个月的数据
             latest_energy = data['energy_data'].iloc[-1]
 
-            scope1 = CarbonCalculator.calculate_scope1(latest_energy)
+            # 使用改进的计算函数
+            scope1 = calculate_scope1_improved(latest_energy)
 
-            st.metric("柴油排放", f"{latest_energy.get('diesel_l', 0) * EMISSION_FACTORS['diesel'] / 1000:.1f} tCO₂")
-            st.metric("天然气排放", f"{latest_energy.get('natural_gas_m3', 0) * EMISSION_FACTORS['natural_gas'] / 1000:.1f} tCO₂")
-            st.metric("直接总排放", f"{scope1:.1f} tCO₂")
+            # 显示指标 - 使用改进的因子
+            diesel_emission = latest_energy.get('diesel_l', 0) * IMPROVED_FACTORS['diesel'] / 1000
+            gas_emission = latest_energy.get('natural_gas_m3', 0) * IMPROVED_FACTORS['natural_gas'] / 1000
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("柴油排放", f"{diesel_emission:.1f} tCO₂")
+            with col2:
+                st.metric("天然气排放", f"{gas_emission:.1f} tCO₂")
+            with col3:
+                st.metric("直接总排放", f"{scope1:.1f} tCO₂")
         else:
             st.warning("暂无能源数据")
+
+        st.session_state.tab1_scope1 = scope1
 
     with tab2:
         st.markdown("### 外购电力排放")
@@ -1295,24 +1692,29 @@ def show_carbon_calculation():
             # 查找月份列
             month_col = None
             for col in energy_data.columns:
-                if 'month' in str(col).lower():
+                if 'month' in str(col).lower() or 'year_month' in str(col).lower():
                     month_col = col
                     break
 
             if month_col:
+                # 让用户选择电网区域
+                st.markdown("##### 选择电网区域")
+                selected_region = st.selectbox(
+                    "电网区域",
+                    list(IMPROVED_FACTORS['electricity'].keys()),
+                    index=0,
+                    key="grid_region_select"
+                )
+
                 # 按月份汇总电力数据
                 electricity_summary = None
 
-                # 尝试不同的列名
                 if 'electricity_kwh' in energy_data.columns:
                     electricity_summary = energy_data.groupby(month_col)['electricity_kwh'].sum().reset_index()
                     electricity_summary = electricity_summary.rename(columns={'electricity_kwh': 'consumption'})
-                elif 'energy_type' in energy_data.columns and 'consumption' in energy_data.columns:
-                    # 筛选电力数据
-                    electricity_mask = energy_data['energy_type'].astype(str).str.contains('electricity|电', case=False, na=False)
-                    if electricity_mask.any():
-                        electricity_data = energy_data[electricity_mask]
-                        electricity_summary = electricity_data.groupby(month_col)['consumption'].sum().reset_index()
+                elif 'electricity_total_kwh' in energy_data.columns:
+                    electricity_summary = energy_data.groupby(month_col)['electricity_total_kwh'].sum().reset_index()
+                    electricity_summary = electricity_summary.rename(columns={'electricity_total_kwh': 'consumption'})
 
                 if electricity_summary is not None and not electricity_summary.empty:
                     # 排序
@@ -1320,34 +1722,19 @@ def show_carbon_calculation():
 
                     # 计算最近一个月的排放
                     latest_month = electricity_summary.iloc[-1]
-                    scope2 = CarbonCalculator.calculate_scope2({
-                        'electricity_kwh': latest_month['consumption']
-                    })
+                    scope2 = calculate_scope2_improved(
+                        {'electricity_kwh': latest_month['consumption']},
+                        selected_region
+                    )
 
                     # 显示指标
-                    st.metric("最近月份电力消耗", f"{latest_month['consumption']:,.0f} kWh")
-                    st.metric("排放因子", f"{EMISSION_FACTORS['electricity']['华东电网']} kg/kWh")
-                    st.metric("外购电力总排放", f"{scope2:.1f} tCO₂")
-
-                    # 创建图表 - 按月汇总
-                    if len(electricity_summary) > 1:
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=electricity_summary[month_col],
-                            y=electricity_summary['consumption'],
-                            mode='lines+markers',
-                            name='电力消耗',
-                            line=dict(color='#65B1F3', width=3)
-                        ))
-
-                        fig.update_layout(
-                            title='月度电力消耗趋势',
-                            xaxis_title='月份',
-                            yaxis_title='电力消耗 (kWh)',
-                            height=400
-                        )
-
-                        st.plotly_chart(fig, use_container_width=True)
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("最近月份电力消耗", f"{latest_month['consumption']:,.0f} kWh")
+                    with col2:
+                        st.metric(f"{selected_region}排放因子", f"{IMPROVED_FACTORS['electricity'][selected_region]} kg/kWh")
+                    with col3:
+                        st.metric("外购电力总排放", f"{scope2:.1f} tCO₂")
                 else:
                     st.warning("没有找到电力消耗数据")
             else:
@@ -1355,46 +1742,283 @@ def show_carbon_calculation():
         else:
             st.warning("暂无能源数据")
 
+        st.session_state.tab2_scope2 = scope2
+        st.session_state.selected_region = selected_region
+
     with tab3:
         st.markdown("### 供应链间接排放")
 
-        # 简化计算
+        # 使用改进的计算方法
         scope3 = 0
+        scope3_details = {'total': 0, 'material': 0, 'transport': 0, 'supplier_count': 0}
 
         if 'supplier_data' in data and not data['supplier_data'].empty:
-            supplier_count = len(data['supplier_data'])
-            scope3 += supplier_count * 100  # 简化计算
+            scope3, scope3_details = calculate_scope3_improved(data['supplier_data'])
 
-        st.metric("供应商数量", supplier_count if 'supplier_data' in data else 0)
-        st.metric("物料排放", f"{supplier_count * 100:.1f} tCO₂")
-        st.metric("供应链间接总排放", f"{scope3:.1f} tCO₂")
+        # 显示详细结果
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("供应商数量", scope3_details['supplier_count'])
+
+        with col2:
+            if scope3_details['supplier_count'] > 0:
+                avg_per_supplier = scope3 / scope3_details['supplier_count']
+                st.metric("平均供应商排放", f"{avg_per_supplier:.1f} tCO₂")
+            else:
+                st.metric("平均供应商排放", "0.0 tCO₂")
+
+        with col3:
+            st.metric("物料排放部分", f"{scope3_details['material']:.1f} tCO₂")
+
+        with col4:
+            st.metric("运输排放部分", f"{scope3_details['transport']:.1f} tCO₂")
+
+        # 总计
+        st.markdown("---")
+        st.metric("**供应链间接总排放**", f"{scope3:.1f} tCO₂")
+
+        # 供应商排放排行
+        if scope3_details.get('supplier_emissions') and len(scope3_details['supplier_emissions']) > 0:
+            with st.expander("供应商碳排放排行", expanded=True):
+
+                # 创建排行表格数据
+                ranking_data = []
+                for i, supplier in enumerate(scope3_details['supplier_emissions'], 1):
+                    ranking_data.append({
+                        '排名': i,
+                        '供应商名称': supplier['supplier_name'],
+                        '供应商类型': supplier['supplier_type'],
+                        '总排放(tCO₂)': round(supplier['total_emission_t'], 2),
+                        '占比(%)': round(supplier.get('emission_percentage', 0), 1),
+                        '物料排放(t)': round(supplier['material_emission_t'], 2),
+                        '运输排放(t)': round(supplier['transport_emission_t'], 2),
+                        '年采购量(吨)': round(supplier['annual_purchase_ton'], 1),
+                        '距离(km)': round(supplier['distance_km'], 0),
+                        '运输方式': supplier['transport_mode']
+                    })
+
+                ranking_df = pd.DataFrame(ranking_data)
+
+                # 显示排行表格
+                st.dataframe(
+                    ranking_df,
+                    use_container_width=True,
+                    column_config={
+                        "排名": st.column_config.NumberColumn(
+                            width="small",
+                            help="按排放量从高到低排名"
+                        ),
+                        "供应商名称": st.column_config.TextColumn(
+                            width="medium",
+                            help="供应商名称"
+                        ),
+                        "总排放(tCO₂)": st.column_config.NumberColumn(
+                            "总排放量",
+                            help="供应商年度总碳排放量（吨）",
+                            format="%.1f tCO2",
+                            width="small"
+                        ),
+                        "占比(%)": st.column_config.ProgressColumn(
+                            "排放占比",
+                            help="供应商排放占总供应链排放的比例",
+                            format="%.1f%%",
+                            min_value=0,
+                            max_value=100,
+                            width="medium"
+                        ),
+                        "物料排放(t)": st.column_config.NumberColumn(
+                            "物料排放",
+                            help="物料采购产生的排放",
+                            format="%.1f tCO2",
+                            width="small"
+                        ),
+                        "运输排放(t)": st.column_config.NumberColumn(
+                            "运输排放",
+                            help="运输过程产生的排放",
+                            format="%.1f tCO2",
+                            width="small"
+                        ),
+                        "年采购量(吨)": st.column_config.NumberColumn(
+                            "年采购量",
+                            format="%.0f t",
+                            width="small"
+                        ),
+                        "距离(km)": st.column_config.NumberColumn(
+                            "运输距离",
+                            format="%.0f km",
+                            width="small"
+                        ),
+                        "运输方式": st.column_config.TextColumn(
+                            width="small",
+                            help="主要运输方式"
+                        )
+                    },
+                    hide_index=True
+                )
+
+                # 可视化排行
+                if len(ranking_data) > 0:
+                    # 前10名排放柱状图
+                    top_n = min(10, len(ranking_data))
+                    top_suppliers = ranking_df.head(top_n)
+
+                    fig = go.Figure()
+
+                    # 物料排放（柱状图底部）
+                    fig.add_trace(go.Bar(
+                        x=top_suppliers['供应商名称'],
+                        y=top_suppliers['物料排放(t)'],
+                        name='物料排放',
+                        marker_color='#FFA726',
+                        text=top_suppliers['物料排放(t)'].round(1),
+                        textposition='outside'
+                    ))
+
+                    # 运输排放（堆叠在物料排放上）
+                    fig.add_trace(go.Bar(
+                        x=top_suppliers['供应商名称'],
+                        y=top_suppliers['运输排放(t)'],
+                        name='运输排放',
+                        marker_color='#26C6DA',
+                        text=top_suppliers['运输排放(t)'].round(1),
+                        textposition='outside'
+                    ))
+
+                    fig.update_layout(
+                        title=f'前{top_n}大排放供应商分析',
+                        xaxis_title="供应商",
+                        yaxis_title="排放量 (tCO₂)",
+                        barmode='stack',
+                        height=400,
+                        showlegend=True
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # 排放构成饼图
+                    if len(ranking_data) > 1:
+                        fig_pie = go.Figure()
+
+                        # 只显示前5名，其他合并为"其他供应商"
+                        if len(ranking_data) > 5:
+                            top_5 = ranking_data[:5]
+                            other_emission = sum(item['总排放(tCO₂)'] for item in ranking_data[5:])
+
+                            labels = [item['供应商名称'] for item in top_5] + ['其他供应商']
+                            values = [item['总排放(tCO₂)'] for item in top_5] + [other_emission]
+                        else:
+                            labels = [item['供应商名称'] for item in ranking_data]
+                            values = [item['总排放(tCO₂)'] for item in ranking_data]
+
+                        fig_pie.add_trace(go.Pie(
+                            labels=labels,
+                            values=values,
+                            hole=0.3,
+                            textinfo='label+percent',
+                            hoverinfo='label+value+percent'
+                        ))
+
+                        fig_pie.update_layout(
+                            title="供应商排放占比分析",
+                            height=350
+                        )
+
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+        # 显示计算说明
+        if scope3_details['supplier_count'] > 0:
+            with st.expander("查看范围3计算详情"):
+                st.write("**计算方法：**")
+                st.write("1. **物料排放** = 年采购量 × 材料排放因子")
+                st.write("2. **运输排放** = 距离 × 单次重量 × 年运输次数 × 运输因子")
+
+                st.write(f"\n**计算结果汇总：**")
+                st.write(f"- 涉及供应商：{scope3_details['supplier_count']}家")
+                st.write(f"- 物料排放总计：{scope3_details['material']:.1f} tCO₂")
+                st.write(f"- 运输排放总计：{scope3_details['transport']:.1f} tCO₂")
+                st.write(f"- 范围3总排放：{scope3:.1f} tCO₂")
+
+                # 显示关键供应商洞察
+                if scope3_details.get('top_emitters'):
+                    st.write("\n**关键洞察：**")
+                    top_supplier = scope3_details['top_emitters'][0]
+                    st.write(f"- 最大排放供应商：**{top_supplier['supplier_name']}**")
+                    st.write(f"  排放量：{top_supplier['total_emission_t']:.1f} tCO₂")
+                    st.write(f"  占比：{top_supplier.get('emission_percentage', 0):.1f}%")
+
+                    # 分析排放主要原因
+                    if top_supplier['material_emission_t'] > top_supplier['transport_emission_t']:
+                        st.write(f"  主要来源：物料采购（{top_supplier['material_emission_t']:.1f} tCO₂）")
+                    else:
+                        st.write(f"  主要来源：运输排放（{top_supplier['transport_emission_t']:.1f} tCO₂）")
+        st.session_state.tab3_scope3 = scope3
+        st.session_state.tab3_scope3_details = scope3_details
 
     with tab4:
         st.markdown("### 综合计算与结果")
 
-        # 计算各项排放
+        # 设置默认值，避免后续代码出错
         scope1 = 0
         scope2 = 0
         scope3 = 0
+        scope3_details = {'total': 0, 'material': 0, 'transport': 0, 'supplier_count': 0}
+        total_emission = 0
 
-        if 'energy_data' in data and not data['energy_data'].empty:
-            latest_energy = data['energy_data'].iloc[-1]
-            scope1 = CarbonCalculator.calculate_scope1(latest_energy)
-            scope2 = CarbonCalculator.calculate_scope2(latest_energy)
+        # 检查前三个tab是否已计算
+        tab1_calculated = 'tab1_scope1' in st.session_state
+        tab2_calculated = 'tab2_scope2' in st.session_state
+        tab3_calculated = 'tab3_scope3' in st.session_state
 
-        if 'supplier_data' in data and not data['supplier_data'].empty:
-            supplier_count = len(data['supplier_data'])
-            scope3 = supplier_count * 100
+        # 如果前三个tab都计算了，直接使用session_state的值
+        if tab1_calculated and tab2_calculated and tab3_calculated:
+            scope1 = st.session_state['tab1_scope1']
+            scope2 = st.session_state['tab2_scope2']
+            scope3 = st.session_state['tab3_scope3']
+            scope3_details = st.session_state['tab3_scope3_details']
+            selected_region = st.session_state.get('selected_region', '华东电网')
 
-        total_emission = scope1 + scope2 + scope3
+            total_emission = scope1 + scope2 + scope3
 
-        # 保存结果
-        st.session_state.emission_results = {
-            'scope1': scope1,
-            'scope2': scope2,
-            'scope3': scope3,
-            'total': total_emission,
-            'calculation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            st.info(f"电网区域：{selected_region} | 供应商数量：{scope3_details.get('supplier_count', 0)}家")
+
+        else:
+            # 如果前三个tab没有全部计算，提示用户
+            st.warning("请先完成前三个范围的碳排放计算")
+
+            missing_tabs = []
+            if not tab1_calculated:
+                missing_tabs.append("直接排放")
+            if not tab2_calculated:
+                missing_tabs.append("外购电力排放")
+            if not tab3_calculated:
+                missing_tabs.append("供应链间接排放")
+
+            st.info(f"需要先计算：{', '.join(missing_tabs)}")
+
+        # 计算完成后，确保保存这个格式：
+        st.session_state['emission_results'] = {
+            'scope1': float(scope1),  # 确保是浮点数
+            'scope2': float(scope2),
+            'scope3': float(scope3),
+            'total': float(total_emission),
+            'calculation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'grid_region': selected_region,  # 保存使用的电网区域
+            'data_source': st.session_state.data_source,
+            # 额外信息（统一放在一个键下）
+            'details': {
+                'scope3_material': float(scope3_details.get('material', 0)),
+                'scope3_transport': float(scope3_details.get('transport', 0)),
+                'supplier_count': int(scope3_details.get('supplier_count', 0))
+            }
+        }
+
+        # 同时保存一份简化版本给其他页面使用
+        st.session_state['carbon_data'] = {
+            'scope1': float(scope1),
+            'scope2': float(scope2),
+            'scope3': float(scope3),
+            'total': float(total_emission)
         }
 
         # 显示结果
@@ -1402,23 +2026,89 @@ def show_carbon_calculation():
 
         with col1:
             # 排放构成图
-            fig = go.Figure(data=[go.Pie(
-                labels=['范围1', '范围2', '范围3'],
-                values=[scope1, scope2, scope3],
-                hole=.3,
-                marker_colors=['#FF6B6B', '#4ECDC4', '#45B7D1']
-            )])
-            fig.update_layout(title="碳排放构成")
-            st.plotly_chart(fig, use_container_width=True)
+            if total_emission > 0:
+                fig = go.Figure(data=[go.Pie(
+                    labels=['范围1（直接）', '范围2（电力）', '范围3（供应链）'],
+                    values=[scope1, scope2, scope3],
+                    hole=.3,
+                    marker_colors=['#FF6B6B', '#4ECDC4', '#45B7D1'],
+                    textinfo='label+percent',
+                    hoverinfo='label+value+percent',
+                    texttemplate='%{label}<br>%{value:.1f}t<br>%{percent}'
+                )])
+                fig.update_layout(
+                    title="碳排放构成",
+                    height=400,
+                    annotations=[dict(
+                        text=f'总计<br>{total_emission:.1f}t',
+                        x=0.5, y=0.5, font_size=16, showarrow=False
+                    )]
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("暂无碳排放数据")
 
         with col2:
             st.metric("总碳排放量", f"{total_emission:.1f} tCO₂")
-            st.metric("范围1（直接排放）占比", f"{scope1 / total_emission * 100 if total_emission > 0 else 0:.1f}%")
-            st.metric("范围2（外购电力排放）占比", f"{scope2 / total_emission * 100 if total_emission > 0 else 0:.1f}%")
-            st.metric("范围3（供应链间接排放）占比", f"{scope3 / total_emission * 100 if total_emission > 0 else 0:.1f}%")
+
+            if total_emission > 0:
+                scope1_pct = scope1 / total_emission * 100
+                scope2_pct = scope2 / total_emission * 100
+                scope3_pct = scope3 / total_emission * 100
+
+                st.metric("范围1（直接排放）",
+                          f"{scope1:.1f} tCO₂")
+
+                st.metric("范围2（外购电力）",
+                          f"{scope2:.1f} tCO₂")
+
+                st.metric("范围3（供应链间接）",
+                          f"{scope3:.1f} tCO₂")
+
+            # 范围3细分
+            with st.expander("查看范围3细分", expanded=False):
+                if scope3_details['total'] > 0:
+                    fig_sub = go.Figure(data=[go.Pie(
+                        labels=['物料排放', '运输排放'],
+                        values=[scope3_details['material'], scope3_details['transport']],
+                        hole=.2,
+                        marker_colors=['#FFA726', '#26C6DA']
+                    )])
+                    fig_sub.update_layout(
+                        title="范围3排放细分",
+                        height=300
+                    )
+                    st.plotly_chart(fig_sub, use_container_width=True)
+
+                    st.write(f"**物料排放**：{scope3_details['material']:.1f} tCO₂")
+                    st.write(f"**运输排放**：{scope3_details['transport']:.1f} tCO₂")
+                    st.write(f"**涉及供应商**：{scope3_details['supplier_count']}家")
+                else:
+                    st.info("暂无范围3细分数据")
+
+        # 运输因子使用情况说明
+        with st.expander("查看运输排放因子使用情况", expanded=False):
+            st.write("**使用了以下运输排放因子：**")
+
+            transport_data = [
+                ["公路运输", IMPROVED_FACTORS['truck_transport'], "kg CO₂/(ton·km)", "主要用于短途和中途运输"],
+                ["铁路运输", IMPROVED_FACTORS['rail_transport'], "kg CO₂/(ton·km)", "节能环保，适合中长途"],
+                ["水路运输", IMPROVED_FACTORS['ship_transport'], "kg CO₂/(ton·km)", "最低碳，适合大宗货物长途"],
+                ["航空运输", IMPROVED_FACTORS['air_transport'], "kg CO₂/(ton·km)", "最高碳，紧急或高价值货物"]
+            ]
+
+            transport_df = pd.DataFrame(
+                transport_data,
+                columns=["运输方式", "排放因子", "单位", "适用场景"]
+            )
+
+            st.dataframe(transport_df, use_container_width=True)
+
+            st.write("**因子来源**：基于行业平均值，参考《道路运输企业温室气体排放核算方法与报告指南》")
 
         if st.button("保存计算结果", type="primary", use_container_width=True):
             st.success("计算结果已保存！")
+            st.balloons()
 
 
 def prepare_data_for_ai_analysis(data, emission_results):
@@ -2377,7 +3067,7 @@ def clear_all_data():
     st.session_state.uploaded_data = {}
     st.session_state.manual_data = {}
     st.session_state.emission_results = {}
-    st.session_state.current_dataset = '中型制造企业'
+    st.session_state.current_dataset = '智能电子制造企业'
     st.session_state.data_source = '示例数据'
     st.success("所有数据已清除")
 
@@ -2678,7 +3368,7 @@ def show_system_settings():
     # 系统信息
     with st.expander("ℹ️ 系统信息", expanded=True):
         st.markdown("""
-        **平台版本**: 1.0.0  
+        **平台版本**: 1.5.2  
         **最后更新**: 2025-12-12  
         """)
 
