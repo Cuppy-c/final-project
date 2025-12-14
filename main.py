@@ -2960,7 +2960,7 @@ def show_report_generation():
     - 长期目标：碳中和
 
     ---
-    *本报告由智链云碳足迹管理平台自动生成*
+    *本报告由CarbonFlow碳足迹管理平台自动生成*
     """
 
     st.text_area("报告内容", report_content, height=400)
